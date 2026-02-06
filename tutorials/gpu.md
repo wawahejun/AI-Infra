@@ -24,7 +24,7 @@ GPU 架构层级：
 │  │              SM (Streaming Multiprocessor)           │    │
 │  │  ┌─────────────┐ ┌─────────────┐ ┌───────────────┐  │    │
 │  │  │  寄存器文件  │ │  共享内存   │ │   L1 缓存     │  │    │  ← SM 内部存储
-│  │  │ (256KB+)   │ │  (48-164KB) │ │ (可配置大小)  │  │    │
+│  │  │             │ │           │ │              │  │    │
 │  │  └─────────────┘ └─────────────┘ └───────────────┘  │    │
 │  │                                                      │    │
 │  │  ┌─────────────────────────────────────────────┐    │    │
@@ -166,11 +166,119 @@ CPU 架构:                    GPU 架构:
 **特点**：
 - 可编程的 L1 缓存，程序员显式控制数据的加载和存储
 - 用于 Block 内线程间的**数据共享**和**协作计算**
-- 需要处理** bank conflict** 以避免性能下降
+- 需要处理**bank conflict** 以避免性能下降
 
 **分布式共享内存**（Compute Capability 9.0+）：
 - Cluster 内的不同 Block 可以相互访问对方的共享内存
 - 支持跨 Block 的原子操作
+
+#### 共享内存 Bank Conflict 详解与优化
+
+共享内存被划分为多个 **bank**（存储体），每个 bank 可以独立访问。当多个线程同时访问同一个 bank 的不同地址时，会发生 **bank conflict**，导致访问串行化。
+
+##### Bank 组织方式
+
+| 计算能力 | Bank 数量 | Bank 宽度 |
+|----------|-----------|-----------|
+| 3.x - 6.x | 32 | 4 bytes |
+| 7.x+ | 32 | 4 bytes |
+
+```
+共享内存 Bank 布局（32 个 bank）：
+地址:  0-3   4-7   8-11  12-15 ... 124-127
+      ┌───┐ ┌───┐ ┌───┐ ┌───┐     ┌───┐
+      │ 0 │ │ 1 │ │ 2 │ │ 3 │ ... │31 │  ← Bank ID
+      └───┘ └───┘ └───┘ └───┘     └───┘
+      
+地址映射公式：Bank ID = (地址 / 4) % 32
+```
+
+##### Bank Conflict 类型
+
+**1. 无 Conflict（理想情况）**
+```cpp
+// 每个线程访问不同 bank
+// thread i 访问地址 i * 4
+// Bank ID = (i * 4 / 4) % 32 = i % 32
+__shared__ float data[256];
+float val = data[threadIdx.x];  // 无 conflict
+```
+
+**2. 2-way Conflict**
+```cpp
+// 线程 0 和线程 16 访问同一 bank
+// Bank ID = (0 * 8 / 4) % 32 = 0
+// Bank ID = (16 * 8 / 4) % 32 = 0  ← conflict!
+__shared__ float data[256];
+float val = data[threadIdx.x * 2];  // 2-way conflict
+```
+
+**3. 广播访问（特殊情况）**
+```cpp
+// 所有线程访问同一地址，广播无 conflict
+__shared__ float data[256];
+float val = data[0];  // 广播，无 conflict
+```
+
+##### Bank Conflict 优化技巧
+
+**技巧 1：使用 Padding 避免 Conflict**
+```cpp
+// 原始：2D 数组，按行访问会产生 conflict
+__shared__ float matrix[32][32];  // 每行 32 个元素，同一列在同一 bank
+
+// 优化：添加 padding，使每行 33 个元素
+__shared__ float matrix[32][33];  // 错位分布，避免 conflict
+```
+
+**技巧 2：设计访问模式**
+```cpp
+// 矩阵转置：原始实现有 conflict
+__shared__ float tile[32][32];
+// 读取：tile[threadIdx.y][threadIdx.x]      // 可能 conflict
+// 写入：tile[threadIdx.x][threadIdx.y]      // 可能 conflict
+
+// 优化：使用对角线坐标
+int x = (threadIdx.x + threadIdx.y) % 32;
+int y = threadIdx.x;
+// 读取：tile[y][x]  // 更好的分布
+```
+
+**技巧 3：使用不同数据类型**
+```cpp
+// float 数组（4 字节）容易产生 conflict
+__shared__ float fdata[256];
+
+// 考虑使用 float2/float4 进行向量化访问
+__shared__ float4 f4data[64];  // 每次访问 16 字节，减少 bank 竞争
+```
+
+**技巧 4：规约操作优化**
+```cpp
+// 原始规约：有 bank conflict
+__shared__ float sdata[256];
+for (int s = 1; s < blockDim.x; s *= 2) {
+    if (tid % (2 * s) == 0) {
+        sdata[tid] += sdata[tid + s];  // tid 和 tid+s 可能同 bank
+    }
+    __syncthreads();
+}
+
+// 优化：交错寻址
+for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+        sdata[tid] += sdata[tid + s];  // 更好的 bank 分布
+    }
+    __syncthreads();
+}
+```
+
+##### Bank Conflict 检测
+
+使用 CUDA Profiler (ncu) 检测：
+```bash
+ncu --metrics shared_load_bank_conflict,shared_store_bank_conflict ./program
+```
 
 ---
 
@@ -203,6 +311,47 @@ CPU 架构:                    GPU 架构:
 | **容量** | 数 GB 到数十 GB（显存） |
 | **速度** | **最慢**，高延迟（数百时钟周期） |
 | **物理位置** | 设备 DRAM（显存芯片） |
+
+#### 显存类型演进
+
+GPU 全局内存使用的显存技术经历了多次演进，主要分为两大类：
+
+| 显存类型 | 代表产品 | 带宽 | 特点 | 应用场景 |
+|----------|----------|------|------|----------|
+| **GDDR5** | GTX 980/1060 | ~224 GB/s | 传统显存，功耗较高 | 消费级显卡 |
+| **GDDR6** | RTX 20/30 系列 | ~768 GB/s | 速度提升，功耗优化 | 主流消费级显卡 |
+| **GDDR6X** | RTX 3090/4090 | ~1008 GB/s | PAM4 信号技术，速度碾压 GDDR6 | 旗舰消费级显卡 |
+| **HBM2** | V100 | 900 GB/s | 高带宽，低功耗，堆叠封装 | 数据中心 |
+| **HBM2e** | A100 | 2039 GB/s | 容量和带宽大幅提升 | AI/HPC |
+| **HBM3** | H100 | 3350 GB/s | 更高堆叠，更大容量 | AI 训练/推理 |
+| **HBM3e** | H200/B200 | 4900 GB/s+ | 2024 年最新技术，速度最快 | 大模型训练 |
+
+**HBM (High Bandwidth Memory)** 与 **GDDR** 对比：
+
+```
+GDDR 架构（传统）：
+┌─────────────────────────────────────────┐
+│              GPU 芯片                    │
+└─────────────────────────────────────────┘
+         ↕ PCB 走线（距离远）
+┌─────────┐ ┌─────────┐ ┌─────────┐
+│ GDDR 颗粒 │ │ GDDR 颗粒 │ │ GDDR 颗粒 │  ← 围绕 GPU 布置
+└─────────┘ └─────────┘ └─────────┘
+
+HBM 架构（堆叠）：
+┌─────────────────────────────────────────┐
+│              GPU 芯片                    │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐   │
+│  │ HBM 堆叠 │ │ HBM 堆叠 │ │ HBM 堆叠 │   │  ← 2.5D 封装，距离近
+│  │ (8-12层)│ │ (8-12层)│ │ (8-12层)│   │
+│  └─────────┘ └─────────┘ └─────────┘   │
+└─────────────────────────────────────────┘
+        硅中介层 (Interposer)
+```
+
+**关键区别**：
+- **GDDR**：颗粒分散在 PCB 上，通过长走线连接，功耗高，适合消费级显卡
+- **HBM**：通过硅中介层与 GPU 封装在一起，走线短，带宽极高，功耗低，适合数据中心
 
 **访问优化要点**：
 - **合并访问**（Coalesced Access）：相邻线程访问相邻内存地址，可合并为一次事务
@@ -284,6 +433,78 @@ CPU 架构:                    GPU 架构:
 
 ---
 
+## 最新架构特性（Hopper/Blackwell）
+
+### NVIDIA GPU 架构演进
+
+| 架构 | 代表产品 | 年份 | 计算能力 | 主要特性 |
+|------|----------|------|----------|----------|
+| Pascal | P100 | 2016 | 6.0 | 第一代 NVLink，Unified Memory |
+| Volta | V100 | 2017 | 7.0 | Tensor Core，独立 L1/共享内存 |
+| Turing | T4/RTX 20 | 2018 | 7.5 | RT Core，GDDR6 |
+| Ampere | A100/RTX 30 | 2020 | 8.0 | MIG，稀疏性加速，多播存储 |
+| Hopper | H100/H200 | 2022-2024 | 9.0 | HBM3，DPX，TMA，分布式共享内存 |
+| Blackwell | B200 | 2024-2025 | 10.0 | HBM3e，第二代 Transformer Engine |
+
+### Hopper 架构新特性（H100/H200）
+
+#### 1. Tensor Memory Accelerator (TMA)
+
+TMA 是 Hopper 引入的硬件单元，专门用于加速全局内存与共享内存之间的数据传输：
+
+```
+传统方式（无 TMA）：
+线程 → 计算地址 → 加载数据 → 存储到共享内存
+（每个线程独立执行，地址计算占用计算资源）
+
+TMA 方式：
+线程 → 配置 TMA 描述符 → TMA 硬件自动传输
+（线程专注于计算，数据传输由专用硬件完成）
+```
+
+**优势**：
+- 减少线程的地址计算开销
+- 支持异步数据传输，与计算重叠
+- 自动处理数据布局和边界
+
+#### 2. 分布式共享内存（Distributed Shared Memory）
+
+Compute Capability 9.0+ 支持 Cluster 内的 Block 相互访问共享内存：
+
+```
+传统（CC < 9.0）：                    Hopper（CC 9.0+）：
+┌─────────┐ ┌─────────┐              ┌─────────┐ ┌─────────┐
+│ Block 0 │ │ Block 1 │              │ Block 0 │←→│ Block 1 │
+│  SM 0   │ │  SM 1   │              │  SM 0   │ │  SM 1   │
+│ Shared0 │ │ Shared1 │              │ Shared0 │←→│ Shared1 │
+└─────────┘ └─────────┘              └─────────┘ └─────────┘
+    ❌ 无法直接访问                      ✅ Cluster 内可互相访问
+```
+
+**使用场景**：
+- 需要跨 Block 协作的算法
+- 大矩阵分块计算
+- 支持跨 Block 的原子操作
+
+#### 3. HBM3/HBM3e 高带宽内存
+
+| GPU | 显存类型 | 显存容量 | 带宽 |
+|-----|----------|----------|------|
+| H100 | HBM3 | 80 GB | 3350 GB/s |
+| H200 | HBM3e | 141 GB | 4900 GB/s |
+| B200 | HBM3e | 192 GB | 8000 GB/s+ |
+
+### Blackwell 架构前瞻（B200）
+
+2024-2025 年推出的 Blackwell 架构主要改进：
+
+- **HBM3e 全面普及**：所有 Blackwell GPU 采用 HBM3e，带宽大幅提升
+- **第二代 Transformer Engine**：支持更低精度计算（FP4/FP6），AI 推理性能翻倍
+- **更高功耗设计**：单卡功耗达 1000W（相比 H100 的 700W）
+- **更大显存容量**：单卡最高 192GB HBM3e
+
+---
+
 ## Unified Memory（统一内存）
 
 现代 GPU（Pascal 架构+）支持**Unified Memory**，提供单一虚拟地址空间：
@@ -297,4 +518,70 @@ CPU 架构:                    GPU 架构:
 - 简化代码，减少显式数据传输
 - 数据访问模式稀疏或不可预测时
 - 需要超量使用 GPU 内存时
+
+### Unified Memory API 详解
+
+#### 1. 基础内存分配
+
+```cpp
+// 分配统一内存
+float *data;
+cudaMallocManaged(&data, size);
+
+// 使用完毕后释放
+cudaFree(data);
+```
+
+#### 2. 异步预取（PrefetchAsync）
+
+预取数据到指定设备，可与 kernel 执行重叠：
+
+```cpp
+// 预取数据到 GPU（设备 0）
+cudaMemPrefetchAsync(data, size, 0, stream);
+
+// 执行 kernel
+myKernel<<<grid, block, 0, stream>>>(data);
+
+// 预取结果回 CPU
+cudaMemPrefetchAsync(data, size, cudaCpuDeviceId, stream);
+```
+
+**优势**：
+- 非阻塞操作，与计算重叠
+- 减少页面错误开销
+- 显式控制数据位置
+
+#### 3. 内存使用建议（MemAdvise）
+
+向运行时提供数据使用模式的提示：
+
+```cpp
+// 建议数据主要被 GPU 读取（设置只读偏好）
+cudaMemAdvise(data, size, cudaMemAdviseSetReadMostly, 0);
+
+// 建议数据优先驻留在 GPU
+cudaMemAdvise(data, size, cudaMemAdviseSetPreferredLocation, 0);
+
+// 建议数据访问由设备 0 主导
+cudaMemAdvise(data, size, cudaMemAdviseSetAccessedBy, 0);
+```
+
+**MemAdvise 类型说明**：
+
+| 建议类型 | 作用 | 适用场景 |
+|----------|------|----------|
+| `SetReadMostly` | 数据被多个设备只读访问，创建只读副本 | 查找表、常量数据 |
+| `SetPreferredLocation` | 指定数据优先驻留的设备 | 数据主要由某设备访问 |
+| `SetAccessedBy` | 建立映射关系，减少页面错误 | 多 GPU 协作 |
+
+
+### Unified Memory 性能优化建议
+
+1. **预取优于按需迁移**：在 kernel 执行前显式预取数据
+2. **使用 MemAdvise**：提供使用模式提示，帮助运行时优化
+3. **避免 CPU-GPU 乒乓**：尽量减少数据在两者之间的频繁迁移
+4. **异步操作**：使用 `PrefetchAsync` 与计算重叠
+
+---
 
